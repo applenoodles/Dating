@@ -64,6 +64,31 @@ streamlit run app.py
 
 你只要去申請免費金鑰、貼進 `.env`，輪替與備援程式會自動處理。側欄「搜尋後端狀態」會顯示每家目前有幾把可用金鑰。
 
+### LLM 金鑰也用金鑰池（選用）
+
+搜尋金鑰由 `search.py` 內建輪替；LLM 金鑰則建議外包給成熟的開源閘道 **LiteLLM**，一樣是「申請完貼上就跑」。本專案附了現成設定：
+
+```bash
+# 1. 準備設定檔
+cp litellm.config.example.yaml litellm.config.yaml   # 視需要調整 model_list
+
+# 2. 在 .env 填好金鑰（可串多把）
+#    OPENAI_KEY_1=...  OPENAI_KEY_2=...  GROQ_KEY=...  LITELLM_MASTER_KEY=sk-local-master
+
+# 3. 起閘道（OpenAI 相容，listen :4000）
+docker compose -f docker-compose.llm-gateway.yml up -d
+
+# 4. 讓 date-scout 走閘道
+#    .env:
+#      LLM_BASE_URL=http://localhost:4000/v1
+#      LLM_API_KEY=sk-local-master
+#      LLM_MODEL=gpt-4.1-mini
+```
+
+`litellm.config.yaml` 裡同一個 `model_name` 放多個 deployment，LiteLLM 就會自動在多把金鑰間負載平衡、失敗重試、冷卻 —— 之後申請到新金鑰只要加一行再重啟即可。
+
+> 想要有 Web UI 管理一堆金鑰的，也可以改用 `songquanpeng/one-api`，同樣吐 OpenAI 相容端點，把 `LLM_BASE_URL` 指過去即可。
+
 ### 主要內容來源也是 query-driven
 
 - **Dcard**：用你的城市＋偏好關鍵字打 `search/posts` 搜尋端點（搜不到才補抓各版最新文）。

@@ -1,0 +1,31 @@
+# File: litellm.config.example.yaml
+# LiteLLM 金鑰池設定範例。
+# 同一個 model_name 放多個 deployment = LiteLLM 自動在多把金鑰間負載平衡 + 輪替。
+# 複製成 litellm.config.yaml 後，把金鑰改成 os.environ/<你的環境變數名>。
+
+model_list:
+  # 同名 gpt-4.1-mini，多把 OpenAI 金鑰 -> 自動輪替
+  - model_name: gpt-4.1-mini
+    litellm_params:
+      model: openai/gpt-4.1-mini
+      api_key: os.environ/OPENAI_KEY_1
+  - model_name: gpt-4.1-mini
+    litellm_params:
+      model: openai/gpt-4.1-mini
+      api_key: os.environ/OPENAI_KEY_2
+
+  # 跨家備援：同樣掛在 gpt-4.1-mini 這個別名底下，前面都掛了會掉到這
+  # （Groq 有免費額度，模型名稱依當下可用者調整）
+  - model_name: gpt-4.1-mini
+    litellm_params:
+      model: groq/llama-3.3-70b-versatile
+      api_key: os.environ/GROQ_KEY
+
+router_settings:
+  routing_strategy: simple-shuffle   # 在多把金鑰間打散，等同輪替
+  num_retries: 3                     # 失敗自動重試（會換到下一個 deployment）
+  allowed_fails: 2                   # 某把連續失敗 2 次就冷卻
+  cooldown_time: 60                  # 冷卻 60 秒後再放回池子
+
+litellm_settings:
+  drop_params: true                  # 自動丟掉某些模型不支援的參數，避免報錯
