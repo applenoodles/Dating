@@ -6,3 +6,6 @@ ddgs>=9.0.0
 duckduckgo-search>=6.2.0
 openai>=1.40.0
 python-dotenv>=1.0.1
+# 讓 httpx 走作業系統憑證庫；在企業 SSL 檢查代理 / 自簽 CA 後面也能連外。
+# 乾淨環境或 Docker 內等同預設行為，不影響正常憑證驗證。
+truststore>=0.9.0

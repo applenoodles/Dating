@@ -14,6 +14,16 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+# 讓 httpx / ssl 走作業系統的憑證信任庫。在乾淨環境或 Docker 內等同預設行為，
+# 但能讓本機在「企業 SSL 檢查代理 / 自簽 CA」後面也跑得起來（否則 httpx 會
+# 因為 certifi 不認得代理憑證而 SSL 失敗）。沒裝 truststore 就靜默略過。
+try:
+    import truststore
+
+    truststore.inject_into_ssl()
+except Exception:
+    pass
+
 import search as search_backend
 
 try:
@@ -362,6 +372,46 @@ def make_http_client(cookies: Optional[Dict[str, str]] = None) -> httpx.Client:
     )
 
 
+# 會重試的暫時性狀態：限流 / 伺服器側暫時錯誤。403/404 是「硬擋」，重試也沒用，不重試。
+RETRYABLE_STATUSES = (429, 500, 502, 503, 504)
+
+
+def http_get_with_retry(
+    client: httpx.Client,
+    url: str,
+    *,
+    params: Optional[Dict[str, str]] = None,
+    retries: int = 2,
+    backoff: float = 0.8,
+) -> httpx.Response:
+    """GET 加上指數退避重試，只對連線錯誤 / 逾時 / 限流 / 5xx 重試。
+
+    硬擋（403/404）或其他 4xx 直接回傳，交由呼叫端判斷，不浪費重試。
+    """
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(retries + 1):
+        try:
+            response = client.get(url, params=params)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_exc = exc
+            if attempt >= retries:
+                raise
+            time.sleep(backoff * (2 ** attempt))
+            continue
+
+        if response.status_code in RETRYABLE_STATUSES and attempt < retries:
+            time.sleep(backoff * (2 ** attempt))
+            continue
+
+        return response
+
+    # 理論上不會走到這（迴圈內不是 return 就是 raise），保險用。
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("http_get_with_retry 重試耗盡")
+
+
 def get_city_terms(city: str) -> List[str]:
     city_clean = clean_text(city)
     terms = [city_clean] if city_clean else []
@@ -609,6 +659,22 @@ def build_source_queries(city: str, want: str) -> List[str]:
     return unique_keep_order(queries)[:8]
 
 
+def _dcard_posts(payload) -> List[dict]:
+    """Dcard 不同端點回傳形狀不一：有時是 list，有時包成 {'posts': [...]}。
+
+    search/posts 與 forums/posts 的外層結構可能不同，這裡統一攤平成 list[dict]，
+    讓 post_to_item() 不必假設外層形狀（這是先前無法連外、沒驗證到的風險點）。
+    """
+    if isinstance(payload, list):
+        return [p for p in payload if isinstance(p, dict)]
+    if isinstance(payload, dict):
+        for key in ("posts", "data", "items", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [p for p in value if isinstance(p, dict)]
+    return []
+
+
 def collect_dcard(
     city: str,
     want: str,
@@ -642,20 +708,29 @@ def collect_dcard(
             source_level="content",
         )
 
+    cloudflare_blocked = False
+
     with make_http_client() as client:
         # 1) 主路徑：用使用者關鍵字真的去 Dcard 搜尋。
         for query in build_source_queries(city, want):
             try:
-                response = client.get(
+                response = http_get_with_retry(
+                    client,
                     "https://www.dcard.tw/service/api/v2/search/posts",
                     params={"query": query, "limit": str(search_limit)},
                 )
+
+                # Dcard 伺服器端常被 Cloudflare 擋（資料中心 IP / TLS 指紋），整段
+                # /service/api 都會 403。一旦撞到就沒必要再連打後續 query 與各版備援。
+                if response.status_code == 403:
+                    cloudflare_blocked = True
+                    break
 
                 if response.status_code != 200:
                     notes.append(f"Dcard 搜尋「{query}」回應狀態：{response.status_code}")
                     continue
 
-                posts = response.json()
+                posts = _dcard_posts(response.json())
             except Exception as exc:
                 notes.append(f"Dcard 搜尋「{query}」失敗：{type(exc).__name__}")
                 continue
@@ -670,6 +745,13 @@ def collect_dcard(
 
             time.sleep(0.3)
 
+        if cloudflare_blocked:
+            notes.append(
+                "Dcard 伺服器端被 Cloudflare 阻擋（403）：直連 API 進不去。"
+                "Dcard 內容改由網頁搜尋的 site:www.dcard.tw 帶出，PTT 為主要直讀來源。"
+            )
+            return dedupe_items(items), notes
+
         items = dedupe_items(items)
 
         # 2) 補強路徑：搜尋結果太少時，才掃各版最新文當備援。
@@ -679,7 +761,8 @@ def collect_dcard(
             )
             for forum in DCARD_FORUMS:
                 try:
-                    response = client.get(
+                    response = http_get_with_retry(
+                        client,
                         f"https://www.dcard.tw/service/api/v2/forums/{forum}/posts",
                         params={
                             "popular": "false",
@@ -687,13 +770,17 @@ def collect_dcard(
                         },
                     )
 
+                    if response.status_code == 403:
+                        cloudflare_blocked = True
+                        break
+
                     if response.status_code != 200:
                         notes.append(
                             f"Dcard/{forum} 回應狀態：{response.status_code}"
                         )
                         continue
 
-                    posts = response.json()
+                    posts = _dcard_posts(response.json())
                 except Exception as exc:
                     notes.append(f"Dcard/{forum} 讀取失敗：{type(exc).__name__}")
                     continue
@@ -710,14 +797,22 @@ def collect_dcard(
 
                 time.sleep(0.3)
 
+            if cloudflare_blocked:
+                notes.append(
+                    "Dcard 伺服器端被 Cloudflare 阻擋（403）：直連 API 進不去。"
+                    "Dcard 內容改由網頁搜尋的 site:www.dcard.tw 帶出，PTT 為主要直讀來源。"
+                )
+                return dedupe_items(items), notes
+
             items = dedupe_items(items)
 
         for item in items[:detail_limit]:
             post_id = item.url.rstrip("/").split("/")[-1]
 
             try:
-                detail_response = client.get(
-                    f"https://www.dcard.tw/service/api/v2/posts/{post_id}"
+                detail_response = http_get_with_retry(
+                    client,
+                    f"https://www.dcard.tw/service/api/v2/posts/{post_id}",
                 )
 
                 if detail_response.status_code == 200:
@@ -729,7 +824,8 @@ def collect_dcard(
                         or None
                     )
 
-                comments_response = client.get(
+                comments_response = http_get_with_retry(
+                    client,
                     f"https://www.dcard.tw/service/api/v2/posts/{post_id}/comments",
                     params={
                         "limit": "30",
@@ -737,7 +833,7 @@ def collect_dcard(
                 )
 
                 if comments_response.status_code == 200:
-                    comments = comments_response.json()
+                    comments = _dcard_posts(comments_response.json())
                     comment_lines = []
 
                     for comment in comments:
@@ -898,7 +994,8 @@ def collect_ptt(
             for query in ptt_board_queries(board, city, want):
                 for page in range(1, pages_per_board + 1):
                     try:
-                        response = client.get(
+                        response = http_get_with_retry(
+                            client,
                             f"https://www.ptt.cc/bbs/{board}/search",
                             params={"q": query, "page": str(page)},
                         )
@@ -938,7 +1035,7 @@ def collect_ptt(
 
         for item in items[:max_articles]:
             try:
-                response = client.get(item.url)
+                response = http_get_with_retry(client, item.url)
 
                 if response.status_code == 200:
                     item.content = parse_ptt_article(response.text)
@@ -1039,6 +1136,21 @@ def collect_web_search(
 
         time.sleep(0.2)
 
+    # 完全沒搜到、而且現在只有免金鑰備援（ddgs / SearXNG），給個友善提示。
+    # ddgs 沒額度但較不穩、會逾時；補上免費金鑰能明顯提升穩定度與品質。
+    if not items:
+        available = search_backend.build_providers()
+        only_free = available and all(
+            p.name in ("ddgs", "searxng") for p in available
+        )
+        if only_free:
+            notes.append(
+                "網頁搜尋目前只有免金鑰備援（ddgs / SearXNG），較不穩且可能逾時；"
+                "在 .env 設定 BRAVE_API_KEYS 或 GOOGLE_CSE_KEYS（皆有免費額度）可明顯提升穩定度。"
+            )
+        elif not available:
+            notes.append("沒有任何可用的搜尋後端，請在 .env 設定金鑰或啟用 ddgs。")
+
     return dedupe_items(items), notes
 
 
@@ -1083,7 +1195,7 @@ def collect_seed_urls(
     with make_http_client() as client:
         for url in urls:
             try:
-                response = client.get(url)
+                response = http_get_with_retry(client, url)
 
                 if response.status_code >= 400:
                     notes.append(f"手動連結讀取失敗，狀態：{response.status_code}")
@@ -1091,9 +1203,8 @@ def collect_seed_urls(
 
                 soup = BeautifulSoup(response.text, "html.parser")
 
-                title = (
-                    meta_content(soup, "og:title", "twitter:title")
-                    or clean_text(soup.title.get_text(" ")) if soup.title else ""
+                title = meta_content(soup, "og:title", "twitter:title") or (
+                    clean_text(soup.title.get_text(" ")) if soup.title else ""
                 )
 
                 description = meta_content(
