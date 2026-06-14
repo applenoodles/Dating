@@ -548,6 +548,8 @@ def score_item(item: SourceItem, city: str, want: str, days: int) -> float:
 
     if item.source_level == "content":
         score += 1.5
+    elif item.source_level == "social_post":
+        score += 1.0
     elif item.source_level == "url_preview":
         score += 1.0
     elif item.source_level == "search_lead":
@@ -577,6 +579,8 @@ def score_item(item: SourceItem, city: str, want: str, days: int) -> float:
         reason_parts.append("來源未標日期，以檢索日期為準")
     if item.source_level == "search_lead":
         reason_parts.append("搜尋摘要線索需二次確認")
+    elif item.source_level == "social_post":
+        reason_parts.append("社群單則貼文，建議點開原文確認")
 
     item.score = round(score, 2)
     item.reason = "；".join(reason_parts)
@@ -1154,6 +1158,173 @@ def collect_web_search(
     return dedupe_items(items), notes
 
 
+# --------------------------------------------------------------------------- #
+# Threads：可選的「金鑰制」非官方搜尋來源（預設關閉，沒金鑰自動略過）
+# 我們只當 API 客戶端，不自行登入、不繞驗證；金鑰與額度由使用者自理。
+# --------------------------------------------------------------------------- #
+
+THREADS_SEARCH_BASE = "https://api.scrapecreators.com/v1/threads/search"
+
+
+def build_threads_queries(city: str, want: str) -> List[str]:
+    """Threads 搜尋用精簡關鍵字（全國性平台、每把約只回 10 筆，所以不貪多）。"""
+    city = clean_text(city)
+    want_short = truncate(clean_text(want), 20)
+
+    queries = [
+        f"{city} 約會",
+        f"{city} 約會 餐廳",
+        f"{city} 約會 咖啡廳",
+    ]
+    if want_short:
+        queries.insert(0, f"{city} {want_short}")
+
+    return unique_keep_order(queries)[:4]
+
+
+def threads_post_to_item(post: dict, retrieved_at: str) -> Optional[SourceItem]:
+    """把 ScrapeCreators /v1/threads/search 的單篇貼文映成 SourceItem。
+
+    依其文件結構取值：caption.text / code / taken_at / like_count /
+    user.username / text_post_app_info.direct_reply_count，全部防呆，缺欄位不炸。
+    """
+    if not isinstance(post, dict):
+        return None
+
+    code = clean_text(post.get("code"))
+    if not code:
+        return None
+
+    user = post.get("user") if isinstance(post.get("user"), dict) else {}
+    username = clean_text(user.get("username"))
+
+    caption = post.get("caption") if isinstance(post.get("caption"), dict) else {}
+    text = clean_text(caption.get("text"))
+
+    taken_at = post.get("taken_at")
+    published_at = None
+    if isinstance(taken_at, (int, float)) and taken_at > 0:
+        try:
+            dt = (
+                datetime.fromtimestamp(taken_at, TZ)
+                if TZ
+                else datetime.fromtimestamp(taken_at)
+            )
+            published_at = dt.date().isoformat()
+        except (OverflowError, OSError, ValueError):
+            published_at = None
+
+    tpa = (
+        post.get("text_post_app_info")
+        if isinstance(post.get("text_post_app_info"), dict)
+        else {}
+    )
+    likes = post.get("like_count") or 0
+    replies = tpa.get("direct_reply_count") or 0
+
+    if username:
+        url = f"https://www.threads.net/@{username}/post/{code}"
+        platform = f"Threads/@{username}"
+    else:
+        url = f"https://www.threads.net/t/{code}"
+        platform = "Threads/Search"
+
+    title = text[:50] or (f"Threads @{username}" if username else "Threads 貼文")
+
+    return SourceItem(
+        platform=platform,
+        title=clean_text(title),
+        url=url,
+        snippet=clean_text(f"{text}（讚 {likes}／回 {replies}）"),
+        content=text,
+        published_at=published_at,
+        retrieved_at=retrieved_at,
+        source_level="social_post",
+    )
+
+
+def collect_threads(
+    city: str,
+    want: str,
+    days: int,
+    max_per_query: int = 10,
+) -> Tuple[List[SourceItem], List[str]]:
+    """可選的 Threads 非官方搜尋來源。沒設定 THREADS_API_KEY 就直接略過（回空）。
+
+    目前內建 ScrapeCreators（同步 REST、`x-api-key`）。要換別家（Apify 等）只要
+    再加一個對應的 *_post_to_item 映射即可。
+    """
+    notes: List[str] = []
+    items: List[SourceItem] = []
+
+    api_key = (os.getenv("THREADS_API_KEY") or "").strip()
+    if not api_key:
+        return [], []
+
+    provider = (os.getenv("THREADS_API_PROVIDER") or "scrapecreators").strip().lower()
+    if provider != "scrapecreators":
+        notes.append(
+            f"未支援的 THREADS_API_PROVIDER：{provider}"
+            "（目前只內建 scrapecreators），略過 Threads。"
+        )
+        return [], notes
+
+    retrieved_at = retrieval_stamp()
+    start_date = (now_tw() - timedelta(days=days)).date().isoformat()
+    end_date = now_tw().date().isoformat()
+
+    headers = dict(DEFAULT_HEADERS)
+    headers["x-api-key"] = api_key
+    headers["Accept"] = "application/json"
+
+    with httpx.Client(
+        headers=headers,
+        timeout=httpx.Timeout(25.0, connect=10.0),
+        follow_redirects=True,
+    ) as client:
+        for query in build_threads_queries(city, want):
+            try:
+                response = http_get_with_retry(
+                    client,
+                    THREADS_SEARCH_BASE,
+                    params={
+                        "query": query,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                    },
+                )
+
+                if response.status_code in (401, 403):
+                    notes.append(
+                        f"Threads 金鑰被拒（{response.status_code}）：請確認 THREADS_API_KEY。"
+                    )
+                    break
+
+                if response.status_code != 200:
+                    notes.append(
+                        f"Threads 搜尋「{query}」回應狀態：{response.status_code}"
+                    )
+                    continue
+
+                data = response.json()
+            except Exception as exc:
+                notes.append(f"Threads 搜尋「{query}」失敗：{type(exc).__name__}")
+                continue
+
+            posts = (data.get("posts") if isinstance(data, dict) else data) or []
+            for post in posts[:max_per_query]:
+                item = threads_post_to_item(post, retrieved_at)
+                if not item:
+                    continue
+                score_item(item, city, want, days)
+                if item.score >= 1.0:
+                    items.append(item)
+
+            time.sleep(0.3)
+
+    return dedupe_items(items), notes
+
+
 def extract_seed_urls(seed_text: str) -> List[str]:
     raw_urls = re.findall(r"https?://[^\s<>\]\"']+", seed_text or "")
     cleaned_urls = []
@@ -1281,6 +1452,7 @@ def classify_item(item: SourceItem) -> str:
 def source_level_label(level: str) -> str:
     mapping = {
         "content": "已讀內文",
+        "social_post": "社群貼文（建議點開原文）",
         "search_lead": "搜尋摘要線索",
         "url_preview": "連結預覽",
     }
@@ -1576,21 +1748,33 @@ def main() -> None:
             step=5,
         )
 
+        threads_available = bool((os.getenv("THREADS_API_KEY") or "").strip())
+
+        default_sources = [
+            "Dcard 搜尋",
+            "PTT 搜尋",
+            "網頁搜尋",
+            "手動社群連結預覽",
+        ]
+        if threads_available:
+            default_sources.insert(3, "Threads 搜尋（需金鑰）")
+
         source_options = st.multiselect(
             "資料源",
             options=[
                 "Dcard 搜尋",
                 "PTT 搜尋",
                 "網頁搜尋",
+                "Threads 搜尋（需金鑰）",
                 "手動社群連結預覽",
             ],
-            default=[
-                "Dcard 搜尋",
-                "PTT 搜尋",
-                "網頁搜尋",
-                "手動社群連結預覽",
-            ],
+            default=default_sources,
         )
+
+        if "Threads 搜尋（需金鑰）" in source_options and not threads_available:
+            st.caption(
+                "Threads 需在 .env 設定 `THREADS_API_KEY`（預設接 ScrapeCreators）才會實際抓取，否則自動略過。"
+            )
 
         with st.expander("搜尋後端狀態"):
             backend_lines = search_backend.provider_status()
@@ -1656,6 +1840,13 @@ def main() -> None:
                 all_items.extend(items)
                 all_notes.extend(notes)
                 st.write(f"網頁搜尋完成：{len(items)} 筆候選來源")
+
+            if "Threads 搜尋（需金鑰）" in source_options:
+                st.write("用關鍵字搜尋 Threads 公開貼文（需 API 金鑰，未設定則略過）...")
+                items, notes = collect_threads(city, want, days)
+                all_items.extend(items)
+                all_notes.extend(notes)
+                st.write(f"Threads 完成：{len(items)} 筆候選來源")
 
             if "手動社群連結預覽" in source_options and clean_text(seed_text):
                 st.write("讀取你手動貼上的公開連結 metadata...")

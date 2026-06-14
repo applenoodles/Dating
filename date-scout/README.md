@@ -15,6 +15,9 @@
    - 不做登入爬蟲、不繞驗證、不碰付費牆。
    - 透過免費搜尋套件抓公開搜尋結果標題與摘要。
    - 也可以把手上的公開貼文連結貼進 App，抓公開 metadata 當來源。
+   - **Threads 即時搜尋（選用、需金鑰）**：設定 `THREADS_API_KEY` 後，會額外用關鍵字打
+     非官方 Threads 搜尋 API（預設 ScrapeCreators）抓公開貼文內文與讚／回數，標為
+     「社群貼文（建議點開原文）」。我們只當 API 客戶端、不自行登入；沒設金鑰就自動略過。
 4. **LLM：只負責整理與判斷，不憑空編資料**
    - 每個建議都附來源與檢索日期。
    - IG / Threads / X 若只是搜尋摘要，會標註「社群搜尋線索，需點開確認」。
@@ -84,6 +87,8 @@ docker compose up -d --build
 | `GOOGLE_CSE_KEYS` | Google CSE 金鑰，逗號分隔可串多把 |
 | `GOOGLE_CSE_CX` | Google 可程式化搜尋引擎 ID |
 | `SEARXNG_INSTANCES` | 免金鑰 SearXNG 公開實例 URL，逗號分隔可串多個 |
+| `THREADS_API_KEY` | 選用。非官方 Threads 搜尋 API 金鑰（預設 ScrapeCreators），留空則整個 Threads 來源自動略過 |
+| `THREADS_API_PROVIDER` | Threads 來源供應商，預設 `scrapecreators` |
 
 ## 搜尋後端（資料來源的核心）
 
@@ -131,6 +136,7 @@ docker compose --profile llm up -d --build
 | Dcard（被 Cloudflare 擋時） | 改由 `site:www.dcard.tw` 網頁搜尋帶出 | 中，不保證即時 | 搜尋摘要線索 |
 | 免費網頁搜尋 | 補充來源、找社群線索 | 中，不保證即時 | 搜尋摘要線索 |
 | IG / Threads / X 搜尋結果 | 社群風向線索 | 中低，需點開確認 | 搜尋摘要線索 |
+| Threads API（設了金鑰時） | 社群即時內文 | 高，可帶時間範圍 | 社群貼文（建議點開原文） |
 | 手動貼上的社群連結 | 你看到的貼文補強 | 取決於貼文 | 連結預覽 |
 
 ## 設計準則
