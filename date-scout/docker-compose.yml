@@ -1,0 +1,36 @@
+# File: docker-compose.yml
+# 一鍵啟動。兩種用法：
+#
+#   只跑 App（規則版摘要，免 LLM）：
+#     docker compose up -d --build
+#     -> 開 http://localhost:8501
+#
+#   App + LiteLLM 金鑰池閘道（要用 LLM）：
+#     cp litellm.config.example.yaml litellm.config.yaml
+#     # 在 .env 填好金鑰，並設：
+#     #   LLM_BASE_URL=http://litellm:4000/v1
+#     #   LLM_API_KEY=${LITELLM_MASTER_KEY}
+#     docker compose --profile llm up -d --build
+#
+# 搜尋金鑰（BRAVE_API_KEYS 等）一律放 .env，會自動帶進 App。
+
+services:
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    profiles: ["llm"]          # 預設不啟動，加 --profile llm 才會起
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
+    expose:
+      - "4000"                 # 只給同網段的 app 用；要從主機連就改成 ports
+    volumes:
+      - ./litellm.config.yaml:/app/config.yaml:ro
+    env_file:
+      - .env
+    restart: unless-stopped

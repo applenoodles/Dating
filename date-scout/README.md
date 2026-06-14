@@ -18,27 +18,63 @@
    - Dcard 公開可讀端點、PTT 公開 HTML、免費搜尋套件 `ddgs`。
    - LLM 可用 OpenAI-compatible API（選用）。
 
-## 安裝與執行
+## 怎麼 pull 下來用
+
+先把專案抓下來、切到分支、進到 `date-scout` 資料夾：
 
 ```bash
+git clone https://github.com/applenoodles/dating.git
+cd dating
+git checkout claude/照内容评估实作-mvgv47
 cd date-scout
 
+cp .env.example .env      # 之後把申請到的金鑰填進 .env
+```
+
+接著二選一跑起來。
+
+### 方法 A：Docker（推薦，最省事）
+
+需要先裝 Docker Desktop（Win/Mac）或 Docker Engine（Linux）。
+
+```bash
+# 只跑 App（規則版摘要，不用任何金鑰也能跑）
+docker compose up -d --build
+```
+
+開瀏覽器到 **http://localhost:8501** 就能用了。
+
+要連 LLM 金鑰池（多把金鑰自動輪替）就多一步：
+
+```bash
+cp litellm.config.example.yaml litellm.config.yaml
+# 在 .env 填好金鑰，並設：
+#   LLM_BASE_URL=http://litellm:4000/v1
+#   LLM_API_KEY=sk-local-master        # = LITELLM_MASTER_KEY
+docker compose --profile llm up -d --build
+```
+
+停掉：`docker compose down`（加 `--profile llm` 連閘道一起停）。
+
+### 方法 B：本機 Python（不想用 Docker）
+
+```bash
 python -m venv .venv
-
-# macOS / Linux
-source .venv/bin/activate
-
-# Windows PowerShell
-# .venv\Scripts\Activate.ps1
-
+source .venv/bin/activate          # Windows PowerShell: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-
-cp .env.example .env
-
 streamlit run app.py
 ```
 
-如果要串 LLM，把 `.env` 裡的 `LLM_API_KEY` 填上即可；不填也能跑，只是會用規則版摘要。
+一樣開 **http://localhost:8501**。
+
+### 開始用
+
+1. 左側欄填城市/區域、調整天數，展開「搜尋後端狀態」確認有幾把金鑰可用。
+2. 中間填你的偏好（例如「想要有吃有玩、第一次約會、不要太貴、要有雨天備案」）。
+3. 有看到的 IG/Threads/X 公開貼文連結可貼進「手動補充」框。
+4. 按「開始檢索」，下面就會出報告，可直接下載 Markdown。
+
+> 不填任何金鑰也能跑：搜尋會掉到免金鑰的 ddgs/SearXNG（較不穩），LLM 會改用規則版摘要。要穩、要好，就去申請免費金鑰填進 `.env`。
 
 ## 環境變數
 
@@ -66,26 +102,20 @@ streamlit run app.py
 
 ### LLM 金鑰也用金鑰池（選用）
 
-搜尋金鑰由 `search.py` 內建輪替；LLM 金鑰則建議外包給成熟的開源閘道 **LiteLLM**，一樣是「申請完貼上就跑」。本專案附了現成設定：
+搜尋金鑰由 `search.py` 內建輪替；LLM 金鑰則建議外包給成熟的開源閘道 **LiteLLM**，一樣是「申請完貼上就跑」。已整合進主 `docker-compose.yml`（`llm` profile）：
 
 ```bash
-# 1. 準備設定檔
 cp litellm.config.example.yaml litellm.config.yaml   # 視需要調整 model_list
-
-# 2. 在 .env 填好金鑰（可串多把）
-#    OPENAI_KEY_1=...  OPENAI_KEY_2=...  GROQ_KEY=...  LITELLM_MASTER_KEY=sk-local-master
-
-# 3. 起閘道（OpenAI 相容，listen :4000）
-docker compose -f docker-compose.llm-gateway.yml up -d
-
-# 4. 讓 date-scout 走閘道
-#    .env:
-#      LLM_BASE_URL=http://localhost:4000/v1
-#      LLM_API_KEY=sk-local-master
-#      LLM_MODEL=gpt-4.1-mini
+# .env 填金鑰並設：
+#   OPENAI_KEY_1=...  OPENAI_KEY_2=...  GROQ_KEY=...  LITELLM_MASTER_KEY=sk-local-master
+#   LLM_BASE_URL=http://litellm:4000/v1
+#   LLM_API_KEY=sk-local-master
+docker compose --profile llm up -d --build
 ```
 
 `litellm.config.yaml` 裡同一個 `model_name` 放多個 deployment，LiteLLM 就會自動在多把金鑰間負載平衡、失敗重試、冷卻 —— 之後申請到新金鑰只要加一行再重啟即可。
+
+> 容器內 App 連閘道用服務名 `http://litellm:4000/v1`；若你是本機 Python（方法 B）跑 App、只用 Docker 跑閘道，則改成 `http://localhost:4000/v1`，並把 compose 裡 litellm 的 `expose` 換成 `ports: ["4000:4000"]`。
 
 > 想要有 Web UI 管理一堆金鑰的，也可以改用 `songquanpeng/one-api`，同樣吐 OpenAI 相容端點，把 `LLM_BASE_URL` 指過去即可。
 
