@@ -4,18 +4,22 @@
 
 ## 核心做法
 
-1. **Dcard / PTT：主要內容來源**
-   - 抓最新文章、內文、留言線索，附來源日期與檢索日期。
+1. **PTT：主要直讀內容來源**
+   - 用各看板原生搜尋 `/bbs/{board}/search` 抓最新文章、內文、留言線索，附來源日期與檢索日期。
    - 適合找「新開幕、約會餐廳、情侶景點、展覽、市集、雨天備案」。
-2. **IG / Threads / X：社群搜尋線索**
+2. **Dcard：主要靠網頁搜尋帶出（直連常被擋）**
+   - Dcard 伺服器端常被 Cloudflare 擋下（資料中心 IP / 非瀏覽器 TLS 指紋會直接吃 403），
+     直連 `/service/api` 進不去；因此 Dcard 內容**主要靠網頁搜尋的 `site:www.dcard.tw` 帶出**。
+   - 直連 collector 仍保留：在沒被擋的網路下能直接讀文章與留言；被擋時會優雅降級（只記一筆狀態、不會卡住）。
+3. **IG / Threads / X：社群搜尋線索**
    - 不做登入爬蟲、不繞驗證、不碰付費牆。
    - 透過免費搜尋套件抓公開搜尋結果標題與摘要。
    - 也可以把手上的公開貼文連結貼進 App，抓公開 metadata 當來源。
-3. **LLM：只負責整理與判斷，不憑空編資料**
+4. **LLM：只負責整理與判斷，不憑空編資料**
    - 每個建議都附來源與檢索日期。
    - IG / Threads / X 若只是搜尋摘要，會標註「社群搜尋線索，需點開確認」。
-4. **不使用付費檢索 API**
-   - Dcard 公開可讀端點、PTT 公開 HTML、免費搜尋套件 `ddgs`。
+5. **不使用付費檢索 API**
+   - PTT 公開 HTML、Dcard 公開端點（可達時）、免費搜尋後端（Brave / Google CSE / SearXNG / `ddgs`）。
    - LLM 可用 OpenAI-compatible API（選用）。
 
 ## 怎麼 pull 下來用
@@ -31,32 +35,9 @@ cd date-scout
 cp .env.example .env      # 之後把申請到的金鑰填進 .env
 ```
 
-接著二選一跑起來。
+接著二選一跑起來。**不一定要 Docker**，本機 Python 就能完整跑。
 
-### 方法 A：Docker（推薦，最省事）
-
-需要先裝 Docker Desktop（Win/Mac）或 Docker Engine（Linux）。
-
-```bash
-# 只跑 App（規則版摘要，不用任何金鑰也能跑）
-docker compose up -d --build
-```
-
-開瀏覽器到 **http://localhost:8501** 就能用了。
-
-要連 LLM 金鑰池（多把金鑰自動輪替）就多一步：
-
-```bash
-cp litellm.config.example.yaml litellm.config.yaml
-# 在 .env 填好金鑰，並設：
-#   LLM_BASE_URL=http://litellm:4000/v1
-#   LLM_API_KEY=sk-local-master        # = LITELLM_MASTER_KEY
-docker compose --profile llm up -d --build
-```
-
-停掉：`docker compose down`（加 `--profile llm` 連閘道一起停）。
-
-### 方法 B：本機 Python（不想用 Docker）
+### 方法 A：本機 Python（推薦，不需 Docker）
 
 ```bash
 python -m venv .venv
@@ -65,7 +46,22 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-一樣開 **http://localhost:8501**。
+開瀏覽器到 **http://localhost:8501** 就能用了。沒填任何金鑰也能跑（搜尋掉到免金鑰 ddgs、LLM 用規則版摘要）。
+
+> **企業/校園網路要注意**：若你的網路有 SSL 檢查代理（自簽根憑證），Python 的 `httpx` 預設會
+> 因為憑證驗證失敗而連不出去。本專案已內建 `truststore`，會自動改走作業系統的憑證信任庫解決這點；
+> 在乾淨環境或 Docker 內它等同預設行為，不影響正常驗證。
+
+### 方法 B：Docker（選用，要打包部署再用）
+
+需要先裝 Docker Desktop（Win/Mac）或 Docker Engine（Linux）。
+
+```bash
+# 只跑 App（規則版摘要，不用任何金鑰也能跑）
+docker compose up -d --build
+```
+
+一樣開 **http://localhost:8501**。停掉：`docker compose down`。
 
 ### 開始用
 
@@ -121,16 +117,18 @@ docker compose --profile llm up -d --build
 
 ### 主要內容來源也是 query-driven
 
+- **PTT**：用各看板原生搜尋 `/bbs/{board}/search?q=`（帶 `over18` cookie），實測穩定可讀內文與留言。
 - **Dcard**：用你的城市＋偏好關鍵字打 `search/posts` 搜尋端點（搜不到才補抓各版最新文）。
-- **PTT**：用各看板原生搜尋 `/bbs/{board}/search?q=`。
-- **網頁/IG/Threads/X**：走上面的搜尋後端 fallback 鏈。
+  伺服器端常被 Cloudflare 擋（403）；被擋時自動降級，Dcard 內容改由下方網頁搜尋的 `site:www.dcard.tw` 帶出。
+- **網頁/IG/Threads/X**：走上面的搜尋後端 fallback 鏈（含 `site:www.dcard.tw`、`site:threads.net` 等定向查詢）。
 
 ## 資料來源規則
 
 | 來源 | 角色 | 新鮮度 | 可信層級 |
 |---|---|---|---|
-| Dcard | 主要內容來源 | 高，可抓最新文章 | 已讀內文 |
-| PTT | 主要內容來源 | 高，可抓最新看板文章 | 已讀內文 |
+| PTT | 主要直讀內容來源 | 高，可抓最新看板文章 | 已讀內文 |
+| Dcard（直連可達時） | 內容來源 | 高，可抓最新文章 | 已讀內文 |
+| Dcard（被 Cloudflare 擋時） | 改由 `site:www.dcard.tw` 網頁搜尋帶出 | 中，不保證即時 | 搜尋摘要線索 |
 | 免費網頁搜尋 | 補充來源、找社群線索 | 中，不保證即時 | 搜尋摘要線索 |
 | IG / Threads / X 搜尋結果 | 社群風向線索 | 中低，需點開確認 | 搜尋摘要線索 |
 | 手動貼上的社群連結 | 你看到的貼文補強 | 取決於貼文 | 連結預覽 |
