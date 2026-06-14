@@ -14,6 +14,8 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+import search as search_backend
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -587,65 +589,128 @@ def hide_bare_urls(markdown: str) -> str:
     return BARE_URL_RE.sub(lambda match: f"[來源連結](<{match.group(0)}>)", markdown)
 
 
+def build_source_queries(city: str, want: str) -> List[str]:
+    """給 Dcard / PTT 原生搜尋用的純關鍵字 query（不含 site: 前綴）。"""
+    city = clean_text(city)
+    want_short = truncate(clean_text(want), 30)
+
+    queries = [
+        f"{city} 約會",
+        f"{city} 約會 餐廳",
+        f"{city} 情侶 推薦",
+        f"{city} 約會 景點",
+        f"{city} 約會 咖啡廳",
+    ]
+
+    if want_short:
+        queries.insert(0, f"{city} 約會 {want_short}")
+        queries.insert(1, f"{city} {want_short}")
+
+    return unique_keep_order(queries)[:8]
+
+
 def collect_dcard(
     city: str,
     want: str,
     days: int,
     limit_per_forum: int = 40,
     detail_limit: int = 15,
+    search_limit: int = 30,
+    recency_min_items: int = 8,
 ) -> Tuple[List[SourceItem], List[str]]:
     notes: List[str] = []
     items: List[SourceItem] = []
     retrieved_at = retrieval_stamp()
 
+    def post_to_item(post: dict, fallback_forum: str = "") -> Optional[SourceItem]:
+        post_id = post.get("id")
+        if not post_id:
+            return None
+
+        forum_alias = post.get("forumAlias") or fallback_forum
+        title = clean_text(post.get("title"))
+        excerpt = clean_text(post.get("excerpt"))
+        topics = " ".join(post.get("topics") or [])
+
+        return SourceItem(
+            platform=f"Dcard/{post.get('forumName') or fallback_forum or '搜尋'}",
+            title=title or f"Dcard post {post_id}",
+            url=f"https://www.dcard.tw/f/{forum_alias or 'all'}/p/{post_id}",
+            snippet=clean_text(f"{excerpt} {topics}"),
+            published_at=(post.get("createdAt") or "")[:10] or None,
+            retrieved_at=retrieved_at,
+            source_level="content",
+        )
+
     with make_http_client() as client:
-        for forum in DCARD_FORUMS:
+        # 1) 主路徑：用使用者關鍵字真的去 Dcard 搜尋。
+        for query in build_source_queries(city, want):
             try:
                 response = client.get(
-                    f"https://www.dcard.tw/service/api/v2/forums/{forum}/posts",
-                    params={
-                        "popular": "false",
-                        "limit": str(limit_per_forum),
-                    },
+                    "https://www.dcard.tw/service/api/v2/search/posts",
+                    params={"query": query, "limit": str(search_limit)},
                 )
 
                 if response.status_code != 200:
-                    notes.append(f"Dcard/{forum} 回應狀態：{response.status_code}")
+                    notes.append(f"Dcard 搜尋「{query}」回應狀態：{response.status_code}")
                     continue
 
                 posts = response.json()
             except Exception as exc:
-                notes.append(f"Dcard/{forum} 讀取失敗：{type(exc).__name__}")
+                notes.append(f"Dcard 搜尋「{query}」失敗：{type(exc).__name__}")
                 continue
 
             for post in posts:
-                post_id = post.get("id")
-                if not post_id:
+                item = post_to_item(post)
+                if not item:
                     continue
-
-                forum_alias = post.get("forumAlias") or forum
-                title = clean_text(post.get("title"))
-                excerpt = clean_text(post.get("excerpt"))
-                topics = " ".join(post.get("topics") or [])
-
-                item = SourceItem(
-                    platform=f"Dcard/{post.get('forumName') or forum}",
-                    title=title or f"Dcard post {post_id}",
-                    url=f"https://www.dcard.tw/f/{forum_alias}/p/{post_id}",
-                    snippet=clean_text(f"{excerpt} {topics}"),
-                    published_at=(post.get("createdAt") or "")[:10] or None,
-                    retrieved_at=retrieved_at,
-                    source_level="content",
-                )
-
                 score_item(item, city, want, days)
-
                 if item.score >= 1.5:
                     items.append(item)
 
             time.sleep(0.3)
 
         items = dedupe_items(items)
+
+        # 2) 補強路徑：搜尋結果太少時，才掃各版最新文當備援。
+        if len(items) < recency_min_items:
+            notes.append(
+                f"Dcard 搜尋結果偏少（{len(items)} 筆），補抓各版最新文。"
+            )
+            for forum in DCARD_FORUMS:
+                try:
+                    response = client.get(
+                        f"https://www.dcard.tw/service/api/v2/forums/{forum}/posts",
+                        params={
+                            "popular": "false",
+                            "limit": str(limit_per_forum),
+                        },
+                    )
+
+                    if response.status_code != 200:
+                        notes.append(
+                            f"Dcard/{forum} 回應狀態：{response.status_code}"
+                        )
+                        continue
+
+                    posts = response.json()
+                except Exception as exc:
+                    notes.append(f"Dcard/{forum} 讀取失敗：{type(exc).__name__}")
+                    continue
+
+                for post in posts:
+                    item = post_to_item(post, fallback_forum=forum)
+                    if not item:
+                        continue
+
+                    score_item(item, city, want, days)
+
+                    if item.score >= 1.5:
+                        items.append(item)
+
+                time.sleep(0.3)
+
+            items = dedupe_items(items)
 
         for item in items[:detail_limit]:
             post_id = item.url.rstrip("/").split("/")[-1]
@@ -798,16 +863,22 @@ def parse_ptt_article(html: str) -> str:
     return truncate(clean_text(text), 4000)
 
 
-def find_ptt_prev_page(html: str) -> Optional[str]:
-    soup = BeautifulSoup(html, "html.parser")
+def ptt_board_queries(board: str, city: str, want: str) -> List[str]:
+    """每個看板用使用者關鍵字去 PTT 原生搜尋。"""
+    want_short = truncate(clean_text(want), 20)
 
-    for link in soup.select(".btn-group-paging a"):
-        if "上頁" in link.get_text(" "):
-            href = link.get("href")
-            if href:
-                return urljoin("https://www.ptt.cc", href)
+    if board in PTT_BOARD_CITY_TERMS:
+        # 地方版本身已限定城市，直接搜約會語意即可。
+        queries = ["約會", "情侶 推薦"]
+    else:
+        # 美食 / 咖啡 / 旅遊等全國版，要帶城市關鍵字。
+        city_term = (get_city_terms(city) or [clean_text(city)])[0]
+        queries = [f"{city_term} 約會", city_term]
 
-    return None
+    if want_short:
+        queries.insert(0, want_short)
+
+    return unique_keep_order(queries)[:3]
 
 
 def collect_ptt(
@@ -824,37 +895,44 @@ def collect_ptt(
 
     with make_http_client(cookies={"over18": "1"}) as client:
         for board in boards:
-            page_url = f"https://www.ptt.cc/bbs/{board}/index.html"
+            for query in ptt_board_queries(board, city, want):
+                for page in range(1, pages_per_board + 1):
+                    try:
+                        response = client.get(
+                            f"https://www.ptt.cc/bbs/{board}/search",
+                            params={"q": query, "page": str(page)},
+                        )
 
-            for _ in range(pages_per_board):
-                try:
-                    response = client.get(page_url)
+                        if response.status_code != 200:
+                            if page == 1:
+                                notes.append(
+                                    f"PTT/{board} 搜尋「{query}」狀態："
+                                    f"{response.status_code}"
+                                )
+                            break
 
-                    if response.status_code != 200:
-                        notes.append(f"PTT/{board} 回應狀態：{response.status_code}")
+                        page_items = parse_ptt_entries(
+                            response.text,
+                            board,
+                            retrieved_at,
+                        )
+
+                        if not page_items:
+                            break
+
+                        for item in page_items:
+                            score_item(item, city, want, days)
+
+                            if item.score >= 1.0:
+                                items.append(item)
+
+                        time.sleep(0.2)
+                    except Exception as exc:
+                        notes.append(
+                            f"PTT/{board} 搜尋「{query}」失敗："
+                            f"{type(exc).__name__}"
+                        )
                         break
-
-                    page_items = parse_ptt_entries(
-                        response.text,
-                        board,
-                        retrieved_at,
-                    )
-
-                    for item in page_items:
-                        score_item(item, city, want, days)
-
-                        if item.score >= 1.0:
-                            items.append(item)
-
-                    next_url = find_ptt_prev_page(response.text)
-                    if not next_url:
-                        break
-
-                    page_url = next_url
-                    time.sleep(0.2)
-                except Exception as exc:
-                    notes.append(f"PTT/{board} 讀取失敗：{type(exc).__name__}")
-                    break
 
         items = dedupe_items(items)
 
@@ -910,47 +988,6 @@ def timelimit_for_days(days: int) -> str:
     return "y"
 
 
-def import_ddgs():
-    try:
-        from ddgs import DDGS
-
-        return DDGS
-    except ImportError:
-        from duckduckgo_search import DDGS
-
-        return DDGS
-
-
-def ddgs_text(searcher, query: str, max_results: int, timelimit: str):
-    try:
-        return list(
-            searcher.text(
-                query,
-                region="tw-tzh",
-                safesearch="moderate",
-                timelimit=timelimit,
-                max_results=max_results,
-            )
-        )
-    except TypeError:
-        try:
-            return list(
-                searcher.text(
-                    query,
-                    region="tw-tzh",
-                    safesearch="moderate",
-                    max_results=max_results,
-                )
-            )
-        except TypeError:
-            return list(
-                searcher.text(
-                    keywords=query,
-                    max_results=max_results,
-                )
-            )
-
-
 def collect_web_search(
     city: str,
     want: str,
@@ -963,67 +1000,44 @@ def collect_web_search(
     queries = build_search_queries(city, want)
     timelimit = timelimit_for_days(days)
 
-    try:
-        DDGS = import_ddgs()
-    except Exception as exc:
-        return [], [f"免費搜尋套件載入失敗：{type(exc).__name__}"]
-
-    try:
+    for query in queries:
         try:
-            searcher = DDGS(timeout=20)
-        except TypeError:
-            searcher = DDGS()
+            hits = search_backend.search_web(
+                query,
+                max_results=max_results_per_query,
+                timelimit=timelimit,
+                notes=notes,
+            )
+        except Exception as exc:
+            notes.append(f"網頁搜尋失敗：{query}；{type(exc).__name__}")
+            continue
 
-        for query in queries:
-            try:
-                results = ddgs_text(
-                    searcher,
-                    query,
-                    max_results=max_results_per_query,
-                    timelimit=timelimit,
-                )
+        for hit in hits:
+            href = hit.href
+            if not href:
+                continue
 
-                for result in results:
-                    title = clean_text(
-                        result.get("title")
-                        or result.get("name")
-                        or query
-                    )
+            title = clean_text(hit.title or query)
+            body = clean_text(hit.body)
 
-                    href = result.get("href") or result.get("url")
-                    body = clean_text(
-                        result.get("body")
-                        or result.get("snippet")
-                        or ""
-                    )
+            item = SourceItem(
+                platform=detect_platform(href),
+                title=title,
+                url=href,
+                snippet=clean_text(
+                    f"{body} 搜尋詞：{query}｜後端：{hit.provider}"
+                ),
+                published_at=None,
+                retrieved_at=retrieved_at,
+                source_level="search_lead",
+            )
 
-                    if not href:
-                        continue
+            score_item(item, city, want, days)
 
-                    item = SourceItem(
-                        platform=detect_platform(href),
-                        title=title,
-                        url=href,
-                        snippet=clean_text(f"{body} 搜尋詞：{query}"),
-                        published_at=None,
-                        retrieved_at=retrieved_at,
-                        source_level="search_lead",
-                    )
+            if item.score >= 1.0:
+                items.append(item)
 
-                    score_item(item, city, want, days)
-
-                    if item.score >= 1.0:
-                        items.append(item)
-
-                time.sleep(0.8)
-            except Exception as exc:
-                notes.append(f"免費搜尋失敗：{query}；{type(exc).__name__}")
-
-        close_method = getattr(searcher, "close", None)
-        if callable(close_method):
-            close_method()
-    except Exception as exc:
-        notes.append(f"免費搜尋初始化失敗：{type(exc).__name__}")
+        time.sleep(0.2)
 
     return dedupe_items(items), notes
 
@@ -1454,18 +1468,30 @@ def main() -> None:
         source_options = st.multiselect(
             "資料源",
             options=[
-                "Dcard 最新",
-                "PTT 最新",
-                "免費網頁搜尋",
+                "Dcard 搜尋",
+                "PTT 搜尋",
+                "網頁搜尋",
                 "手動社群連結預覽",
             ],
             default=[
-                "Dcard 最新",
-                "PTT 最新",
-                "免費網頁搜尋",
+                "Dcard 搜尋",
+                "PTT 搜尋",
+                "網頁搜尋",
                 "手動社群連結預覽",
             ],
         )
+
+        with st.expander("搜尋後端狀態"):
+            backend_lines = search_backend.provider_status()
+            if backend_lines:
+                for line in backend_lines:
+                    st.write(f"- {line}")
+            else:
+                st.warning("沒有可用的搜尋後端，請在 .env 設定金鑰或啟用 ddgs。")
+            st.caption(
+                "可在 .env 用逗號串多把免費金鑰："
+                "`BRAVE_API_KEYS`、`GOOGLE_CSE_KEYS`(+`GOOGLE_CSE_CX`)、`SEARXNG_INSTANCES`。"
+            )
 
         llm_available = bool(os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY"))
 
@@ -1499,26 +1525,26 @@ def main() -> None:
         all_notes: List[str] = []
 
         with st.status("檢索中...", expanded=True) as status:
-            if "Dcard 最新" in source_options:
-                st.write("讀取 Dcard 最新文章與留言線索...")
+            if "Dcard 搜尋" in source_options:
+                st.write("用關鍵字搜尋 Dcard 文章與留言線索...")
                 items, notes = collect_dcard(city, want, days)
                 all_items.extend(items)
                 all_notes.extend(notes)
                 st.write(f"Dcard 完成：{len(items)} 筆候選來源")
 
-            if "PTT 最新" in source_options:
-                st.write("讀取 PTT 最新文章...")
+            if "PTT 搜尋" in source_options:
+                st.write("用關鍵字搜尋 PTT 各看板文章...")
                 items, notes = collect_ptt(city, want, days)
                 all_items.extend(items)
                 all_notes.extend(notes)
                 st.write(f"PTT 完成：{len(items)} 筆候選來源")
 
-            if "免費網頁搜尋" in source_options:
-                st.write("執行免費網頁搜尋，包含 Dcard / IG / Threads / X 搜尋線索...")
+            if "網頁搜尋" in source_options:
+                st.write("執行網頁搜尋（多後端備援，含 IG / Threads / X 線索）...")
                 items, notes = collect_web_search(city, want, days)
                 all_items.extend(items)
                 all_notes.extend(notes)
-                st.write(f"免費搜尋完成：{len(items)} 筆候選來源")
+                st.write(f"網頁搜尋完成：{len(items)} 筆候選來源")
 
             if "手動社群連結預覽" in source_options and clean_text(seed_text):
                 st.write("讀取你手動貼上的公開連結 metadata...")
