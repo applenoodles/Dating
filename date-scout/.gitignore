@@ -10,6 +10,8 @@ venv/
 
 # Streamlit
 .streamlit/secrets.toml
+streamlit*.log
+*.err.log
 
 # OS
 .DS_Store
