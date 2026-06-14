@@ -1,0 +1,8 @@
+# File: requirements.txt
+streamlit>=1.36.0
+httpx>=0.27.0
+beautifulsoup4>=4.12.3
+ddgs>=9.0.0
+duckduckgo-search>=6.2.0
+openai>=1.40.0
+python-dotenv>=1.0.1
